@@ -1,333 +1,511 @@
-"""
-PyHealth task for SOZ localization from SPES/CCEP data.
-
-Each sample represents one electrode from one subject. The model predicts
-whether that electrode lies within the Seizure Onset Zone (SOZ).
-
-This module owns the full signal-processing pipeline:
-  1. Load raw EEG + events + channels TSVs for every run.
-  2. Band-pass filter, epoch, baseline-correct, and resample (StimulationDataProcessor).
-  3. Average and compute std across trials; combine across runs (combine_stats).
-  4. Filter stim-recording pairs by Euclidean distance > min_distance_mm.
-  5. Sort remaining pairs by distance (distance becomes the last feature column).
-  6. Yield one sample dict per electrode that appears in both recording and
-     stimulation roles.
-
-Usage::
-
-    from ccep_ecog_dataset import CCEPECoGDataset
-    from ccep_ecog_task import SOZPredictionTask
-
-    dataset = CCEPECoGDataset(root="./data/ds004080")
-    sample_dataset = dataset.set_task(SOZPredictionTask())
-    sample = sample_dataset[0]
-    print(sample["label"])
-"""
-
-import logging
-from typing import Any, Dict, List, Tuple
-
 import mne
 import numpy as np
 import pandas as pd
-import torch
+import pyreadr
+from pathlib import Path
+from typing import Any, Dict, List
+
 from pyhealth.tasks import BaseTask
 
-logger = logging.getLogger(__name__)
 
-_REGIONS = ["Frontal", "Insula", "Limbic", "Occipital", "Parietal", "Temporal", "Unknown"]
-_REGION_TO_IDX = {r: i for i, r in enumerate(_REGIONS)}
-
-
-class SOZPredictionTask(BaseTask):
-    """Binary classification task: predict whether each electrode is in the SOZ.
-
-    For each subject this task:
-      1) Loads the raw BrainVision EEG for every run.
-      2) Applies band-pass filtering (1–150 Hz), extracts SPES epochs
-         (tmin–tmax seconds post-stimulus), baseline-corrects, and resamples
-         to 512 Hz.
-      3) Averages and computes trial-level std; combines statistics across runs
-         for matching stim/recording pairs.
-      4) Filters stim-recording pairs closer than ``min_distance_mm`` mm.
-      5) Sorts remaining pairs by ascending Euclidean distance; distance is
-         stored as the last column of each feature array.
-      6) Returns one sample per electrode that appears in both a recording and
-         a stimulation role.
-
-    Each returned sample contains:
-      - ``X_recording_mean``: torch.FloatTensor, shape (n_stim_pairs, time_steps + 1)
-      - ``X_stim_mean``:      torch.FloatTensor, shape (n_stim_pairs, time_steps + 1)
-      - ``X_recording_std``:  torch.FloatTensor, shape (n_stim_pairs, time_steps + 1)
-      - ``X_stim_std``:       torch.FloatTensor, shape (n_stim_pairs, time_steps + 1)
-      - ``coords``:           torch.FloatTensor, shape (3,)
-      - ``lobe``:             int
-      - ``label``:            int  (1 = SOZ, 0 = not SOZ)
-
-    Examples::
-
-        >>> from ccep_ecog_dataset import CCEPECoGDataset
-        >>> from ccep_ecog_task import SOZPredictionTask
-        >>> dataset = CCEPECoGDataset(root="./data/ds004080")
-        >>> sample_dataset = dataset.set_task(SOZPredictionTask())
-        >>> sample = sample_dataset[0]
-        >>> print(sample["label"])
+def pad_and_stack(arrays, max_rows, pad_value=0):
     """
+    Pad each 2D array to max_rows and stack them into one array.
+    """
+    padded_arrays = []
+    for array in arrays:
+        rows_to_add = max_rows - array.shape[0]
+        if rows_to_add > 0:
+            array = np.pad(
+                array,
+                ((0, rows_to_add), (0, 0)),
+                "constant",
+                constant_values=(pad_value,),
+            )
+        padded_arrays.append(array)
 
-    task_name: str = "soz_prediction"
-    input_schema: Dict[str, str] = {
-        "X_recording_mean": "tensor",
-        "X_stim_mean":      "tensor",
-        "X_recording_std":  "tensor",
-        "X_stim_std":       "tensor",
-        "coords":           "tensor",
-        "lobe":             "tensor",
-    }
-    output_schema: Dict[str, str] = {"label": "binary"}
+    return np.stack(padded_arrays)
 
-    def __init__(
-        self,
-        tmin: float = 0.009,
-        tmax: float = 1.0,
-        destrieux_path: str = "../destrieux.rda",
-        min_distance_mm: float = 13.0,
-    ) -> None:
+
+def process_stimulation_sites(site):
+    """
+    Sort a bipolar stimulation site string so E2-E1 and E1-E2 match.
+    """
+    parts = site.split("-")
+    parts.sort()
+    return "-".join(parts)
+
+
+def is_overlap(event, artefact):
+    return (
+        event["sample_start"] < artefact["sample_end"]
+        and artefact["sample_start"] < event["sample_end"]
+    )
+
+
+def combine_stats(group):
+    """
+    Combine mean/std rows for duplicated stimulation-recording groups.
+    """
+    means = group[group["metric"] == "mean"].select_dtypes(include=[np.number])
+    stds = group[group["metric"] == "std"].select_dtypes(include=[np.number])
+
+    n = 10
+    if len(means) > 1 or len(stds) > 1:
+        total_samples = n * len(means)
+        combined_mean = means.mean()
+        combined_std = np.sqrt(
+            (stds**2).mean()
+            + ((means - combined_mean) ** 2).sum() / (total_samples - 1)
+        )
+    else:
+        combined_mean = means.iloc[0]
+        combined_std = stds.iloc[0]
+
+    mean_df = pd.DataFrame(combined_mean).transpose()
+    std_df = pd.DataFrame(combined_std).transpose()
+
+    for col in ["subject", "recording", "stim_1", "stim_2"]:
+        mean_df[col] = group[col].iloc[0]
+        std_df[col] = group[col].iloc[0]
+
+    mean_df["metric"] = "mean"
+    std_df["metric"] = "std"
+
+    return mean_df, std_df
+
+
+regions = ["Frontal", "Insula", "Limbic", "Occipital", "Parietal", "Temporal", "Unknown"]
+region_to_index = {region: index for index, region in enumerate(regions)}
+_destrieux_df = None
+
+
+def get_destrieux_lobe(label):
+    """
+    Return the Destrieux lobe name for a numeric atlas label.
+    """
+    try:
+        is_missing = bool(np.isnan(label))
+    except (TypeError, ValueError):
+        is_missing = label is None
+
+    if is_missing or label == 0:
+        return "Unknown"
+
+    global _destrieux_df
+    if _destrieux_df is None:
+        try:
+            rda_path = Path(__file__).resolve().parent.parent / "destrieux.rda"
+            _destrieux_df = pyreadr.read_r(str(rda_path))["destrieux"]
+        except Exception:
+            return "Unknown"
+
+    try:
+        return _destrieux_df[_destrieux_df.index == int(label) - 1].lobe.values[0]
+    except Exception:
+        return "Unknown"
+
+
+def _event_value(event, key, default=None):
+    """
+    Read a value from either a PyHealth event object or a metadata dict.
+    """
+    if isinstance(event, dict):
+        return event.get(key, default)
+    return getattr(event, key, default)
+
+
+class StimulationDataProcessor:
+    def __init__(self, tmin, tmax):
         """
+        Initialize the class with minimum and maximum temperature values.
+
         Args:
-            tmin: Epoch start in seconds relative to stimulation onset.
-                The first ``tmin`` seconds are excluded to remove the
-                stimulation artefact. Defaults to 0.009 (9 ms).
-            tmax: Epoch end in seconds relative to stimulation onset.
-                Defaults to 1.0.
-            destrieux_path: Path to ``destrieux.rda`` for lobe mapping.
-            min_distance_mm: Minimum stim-recording Euclidean distance (mm)
-                to retain. Defaults to 13.
+            tmin (float): The minimum temperature value.
+            tmax (float): The maximum temperature value.
         """
-        super().__init__()
         self.tmin = tmin
         self.tmax = tmax
-        self.min_distance_mm = min_distance_mm
 
-        # Load Destrieux atlas once so it isn't re-read for every subject
-        import pyreadr
-        self._destrieux_df = pyreadr.read_r(destrieux_path)["destrieux"]
-
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def load_run(
-        header_file: str,
-        events_file: str,
-        channels_file: str,
-    ) -> Tuple[mne.io.BaseRaw, pd.DataFrame, pd.DataFrame]:
-        """Load one BrainVision run and its paired events/channels TSVs.
-
-        Args:
-            header_file: Path to the ``.vhdr`` file.
-            events_file: Path to the ``*_events.tsv`` file.
-            channels_file: Path to the ``*_channels.tsv`` file.
-
-        Returns:
-            Tuple of (raw EEG, events DataFrame, channels DataFrame).
+    def process_run_data(self, eeg, events_df, channels_df, subject):
         """
-        eeg = mne.io.read_raw_brainvision(header_file, preload=True, verbose=False)
-        events_df   = pd.read_csv(events_file,   sep="\t", index_col=0)
-        channels_df = pd.read_csv(channels_file, sep="\t", index_col=0)
-        return eeg, events_df, channels_df
-
-    @staticmethod
-    def filter_by_distance(
-        response_df: pd.DataFrame,
-        electrodes_df: pd.DataFrame,
-        min_distance_mm: float,
-    ) -> pd.DataFrame:
-        """Remove pairs closer than ``min_distance_mm`` and sort by distance.
-
-        Distance is appended as the last numeric column so that
-        ``select_dtypes(include='number')`` naturally includes it, matching
-        the ``X[:, :, -1]`` convention used in dataset.py.
-
-        Args:
-            response_df: Single-metric response DataFrame.
-            electrodes_df: Electrode metadata with x, y, z columns.
-            min_distance_mm: Distance threshold in mm.
-
-        Returns:
-            Filtered and distance-sorted DataFrame, or the original DataFrame
-            unchanged if coordinate lookup fails.
+        Process and extract stimulation data for a given run.
+        Returns a list of dictionaries, each representing a processed epoch.
         """
+        # Filter channels
+        chans_to_use = channels_df[channels_df.status_description == "included"].index.tolist()
+        eeg.pick(chans_to_use)
+
+        # Filter EEG data
+        eeg.filter(1, 150, n_jobs=-1, method='fir', fir_design='firwin')  # TODO
+
+        # Filter for electrical stimulation events
+        stim_events = events_df[events_df.trial_type == "electrical_stimulation"].copy()
+        
+        # Filter for events that occur within the EEG data
+        before = stim_events.shape[0]
+        stim_events = stim_events[stim_events['sample_start'] < eeg.tmax * eeg.info['sfreq']]
+        after = stim_events.shape[0]
+
+        if before != after:
+            print(subject, before, after)
+
+        # Filter for artefact events
+        artefacts = events_df[np.logical_and(events_df.trial_type == "artefact", 
+                                             events_df.electrodes_involved_onset == "all")].copy()
+
+        # Filter for seizure events
+        seizures = events_df[events_df.trial_type == "seizure"].copy()
+
+        # Creating artefact mask
+        artefact_mask = []
+        for _, stim_event in stim_events.iterrows():
+            overlap = any(is_overlap(stim_event, artefact) for _, artefact in artefacts.iterrows())
+            artefact_mask.append(overlap)
+
+        # Creating the artmask
+        seizure_mask = []
+        for _, stim_event in stim_events.iterrows():
+            overlap = any(is_overlap(stim_event, seizure) for _, seizure in seizures.iterrows())
+            seizure_mask.append(overlap)
+
+        # Create mask of valid events
+        valid_mask = np.logical_not(np.logical_or(artefact_mask, seizure_mask))
+
+        # Filter for valid events
+        stim_events = stim_events[valid_mask]
+
+        # Filter for artefact events occurring on only some channels
+        focal_artefacts = events_df[np.logical_and(events_df.trial_type == "artefact", 
+                                                   events_df.electrodes_involved_onset != "all")].copy()
+
+        # Sort the 'electrical_stimulation_site' column - this ensures that E2-E1 and E1-E2 are treated the same
+        stim_events['electrical_stimulation_site'] = stim_events['electrical_stimulation_site'].apply(process_stimulation_sites)
+
+        # Step 1: Convert 'electrical_stimulation_site' to a categorical datatype
+        stim_events['electrical_stimulation_site'] = stim_events['electrical_stimulation_site'].astype('category')
+
+        # Get mapping of categories to integer codes for 'electrical_stimulation_site'
+        category_mapping = dict(enumerate(stim_events['electrical_stimulation_site'].cat.categories))
+
+        # Create a new column 'electrical_stimulation_site_cat' with integer codes for 'electrical_stimulation_site'
+        stim_events['electrical_stimulation_site_cat'] = stim_events['electrical_stimulation_site'].cat.codes
+
+        # Step 2: Add a column 'zero_column' to the DataFrame with all values set to 0
+        stim_events['zero_column'] = 0
+
+        # Step 3: Extract the columns 'sample_start', 'zero_column', and 'electrical_stimulation_site_cat' and convert to a NumPy array
+        result_array = stim_events[['sample_start', 'zero_column', 'electrical_stimulation_site_cat']].values
+
+        # Creating the artmask
+        overlap_list = []
+
+        for _, stim_event in stim_events.iterrows():
+            overlap_found = False
+            for _, artefact in focal_artefacts.iterrows():
+                if is_overlap(stim_event, artefact):
+                    overlap_list.append(artefact.electrodes_involved_onset)
+                    overlap_found = True
+                    break  # Stop checking after the first overlap is found
+            if not overlap_found:
+                overlap_list.append(None)
+        overlap_list = np.array(overlap_list)
+
+        response_dfs = []
+        
+        for event_id in np.unique(result_array[:, 2]):
+
+            # Chans to remove due to artefact
+            remove_chans = overlap_list[result_array[:, 2] == event_id]
+            remove_chans = np.unique([chan for chan_list in remove_chans if chan_list is not None for chan in chan_list.split(',')])
+
+            response_df = self._extract_epochs(eeg, 
+                                               result_array, 
+                                               event_id, 
+                                               category_mapping, 
+                                               subject, 
+                                               remove_chans)
+            response_dfs.append(response_df)
+
         try:
-            def _coords(electrodes):
-                return np.array([
-                    [electrodes_df.loc[e].x,
-                     electrodes_df.loc[e].y,
-                     electrodes_df.loc[e].z]
-                    for e in electrodes
-                ])
+            response_dfs = pd.concat(response_dfs)
+        except ValueError:
+            print(f"No stimulation events found for subject {subject}")
+            return None        
 
-            stim_coords = (
-                _coords(response_df.stim_1.values) +
-                _coords(response_df.stim_2.values)
-            ) / 2
-            rec_coords = _coords(response_df.recording.values)
-            distances = np.sqrt(np.sum((stim_coords - rec_coords) ** 2, axis=1))
+        return response_dfs
 
-            response_df = response_df[distances > min_distance_mm].copy()
-            response_df["distances"] = distances[distances > min_distance_mm]
-            response_df = response_df.sort_values("distances", ascending=True)
+    def _extract_epochs(self, eeg, result_array, event_id, category_mapping, subject, remove_chans):
+        """
+        Extracts an epoch for a given stimulation event.
+        """
+        stimulated_electrodes = category_mapping[event_id].split('-')
 
-        except Exception as e:
-            logger.warning(f"Distance filtering failed ({e}); skipping.")
+        # When polarity is reversed, ensure no duplication
+        stimulated_electrodes.sort()
+
+        # Get list of electrodes excluding stimulated electrodes
+        recording_channels = [chan for chan in eeg.info['ch_names'] if chan not in stimulated_electrodes]
+
+        # Remove channels that are artefacted
+        recording_channels = [chan for chan in recording_channels if chan not in remove_chans]
+
+        epochs = mne.Epochs(eeg, result_array, event_id=event_id, tmin=self.tmin - 1
+                            , tmax=self.tmax, picks=recording_channels, preload=True, baseline=(None, -0.1))
+        epochs.crop(tmin=self.tmin)
+        epochs.resample(512)
+
+        # If less than 5 trials, return None
+        if (epochs._data.shape[0]) < 5:
+            return None
+                
+        # Calculate mean and standard deviation
+        mean_response = epochs.average()._data  # Shape: (channels, time steps)
+        std_response = epochs._data.std(axis=0)  # Shape: (channels, time steps)
+
+        # Create DataFrame for mean response
+        df_mean_response = pd.DataFrame(mean_response).astype('float32')
+        df_mean_response.insert(0, 'subject', [subject] * mean_response.shape[0])
+        df_mean_response.insert(1, 'recording', epochs.info['ch_names'])
+        df_mean_response.insert(2, 'stim_1', stimulated_electrodes[0])
+        df_mean_response.insert(3, 'stim_2', stimulated_electrodes[1])
+        df_mean_response.insert(4, 'metric', 'mean')
+
+        # Create DataFrame for std response
+        df_std_response = pd.DataFrame(std_response).astype('float32')
+        df_std_response.insert(0, 'subject', [subject] * std_response.shape[0])
+        df_std_response.insert(1, 'recording', epochs.info['ch_names'])
+        df_std_response.insert(2, 'stim_1', stimulated_electrodes[0])
+        df_std_response.insert(3, 'stim_2', stimulated_electrodes[1])
+        df_std_response.insert(4, 'metric', 'std')
+
+        # Concatenate the two DataFrames
+        response_df = pd.concat([df_mean_response, df_std_response], ignore_index=True)
 
         return response_df
 
-    def _get_lobe_index(self, label: int) -> int:
-        """Map a Destrieux integer label to a lobe index (0–6)."""
-        if label == 0:
-            return _REGION_TO_IDX["Unknown"]
-        lobe_name = self._destrieux_df[
-            self._destrieux_df.index == label - 1
-        ].lobe.values[0]
-        return _REGION_TO_IDX.get(lobe_name, _REGION_TO_IDX["Unknown"])
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
+class DatasetCreator:
+    """
+    A class for creating datasets for analysis.
 
-    def __call__(self, patient: Any) -> List[Dict[str, Any]]:
-        """Process one patient and return per-electrode SOZ prediction samples.
+    Args:
+        response_df (pandas.DataFrame): The response dataframe containing subject data.
+
+    Methods:
+        process_for_analysis: Process the data for analysis.
+
+    """
+
+    def __init__(self, response_df):
+        self.response_df = response_df
+
+    def process_for_analysis(self, subject, electrodes_df):
+        """
+        Process the stimulation data for analysis.
 
         Args:
-            patient: A PyHealth ``Patient`` object returned by
-                ``CCEPECoGDataset.get_patient``.  ``patient.data_source`` is
-                a Polars DataFrame with one row per run containing
-                ``header_file``, ``events_file``, ``channels_file``,
-                ``electrodes_file``, and ``has_soz`` columns.
+            subject (str): The subject identifier.
+            electrodes_df (pandas.DataFrame): The dataframe containing the stimulation data.
 
         Returns:
-            List of sample dicts (one per electrode), or an empty list if the
-            subject has no SOZ labels or no usable EEG data.
+            None
         """
-        # Materialise the Polars DataFrame for this patient
-        data = patient.data_source
-        subject = patient.patient_id
+        return self.process_metric_for_analysis(subject, electrodes_df, 'mean', labels=True)
 
-        if not data["has_soz"][0]:
-            return []
+    def process_metric_for_analysis(self, subject, electrodes_df, metric, labels=False):
+        """
+        Process the data for analysis.
 
-        from create_dataset import StimulationDataProcessor, combine_stats
+        Args:
+            subject (str): The subject identifier.
+            electrodes_df (pandas.DataFrame): The dataframe containing electrode data.
+            metric (str): The metric to be analysed.
+            labels (bool, optional): Whether to include labels. Defaults to False.
 
-        mne.set_log_level("WARNING")
-        stim_processor = StimulationDataProcessor(tmin=self.tmin, tmax=self.tmax)
+        Returns:
+            numpy.ndarray or None: The processed data for analysis or None if no stimulation events found.
 
-        # --- Step 1: process all runs ---
-        run_dfs = []
-        for row in data.iter_rows(named=True):
-            if not all(row.get(k) for k in ("header_file", "events_file", "channels_file")):
-                logger.warning(f"{subject} run {row.get('run_id')}: missing file path(s), skipping")
-                continue
-            try:
-                eeg, events_df, channels_df = self.load_run(
-                    row["header_file"], row["events_file"], row["channels_file"]
-                )
-                df = stim_processor.process_run_data(eeg, events_df, channels_df, subject)
-                if df is not None:
-                    run_dfs.append(df)
-            except Exception as e:
-                logger.warning(f"{subject} run {row.get('run_id')}: {e}")
+        """
+        response_df = self.response_df[self.response_df.subject == subject]
+        response_df = response_df[response_df.metric == metric]
 
-        if not run_dfs:
-            logger.warning(f"{subject}: no usable runs, returning no samples")
-            return []
-
-        # --- Step 2: combine stats across runs ---
-        patient_df = pd.concat(run_dfs, ignore_index=True)
-        grouped = patient_df.groupby(["recording", "stim_1", "stim_2"])
-        patient_df = pd.concat(
-            [pd.concat(combine_stats(g)) for _, g in grouped],
-            ignore_index=True,
-        )
-
-        # --- Step 3: load electrode metadata ---
-        # Each run row stores the session-specific electrode file; use the
-        # first row (all runs in the same session share the same file).
-        electrodes_file = data["electrodes_file"][0]
         try:
-            electrodes_df = pd.read_csv(electrodes_file, sep="\t", index_col=0)
-        except Exception as e:
-            logger.warning(f"{subject}: could not load electrodes file: {e}")
-            return []
+            # Calculate stimulation and recording coordinates
+            stim_1_coords = np.array([
+                                        [electrodes_df[electrodes_df.index == stimulated_electrode].x,
+                                        electrodes_df[electrodes_df.index == stimulated_electrode].y,
+                                        electrodes_df[electrodes_df.index == stimulated_electrode].z
+                                      ] for stimulated_electrode in response_df.stim_1])
+            stim_2_coords = np.array([
+                                        [electrodes_df[electrodes_df.index == stimulated_electrode].x,
+                                        electrodes_df[electrodes_df.index == stimulated_electrode].y,
+                                        electrodes_df[electrodes_df.index == stimulated_electrode].z
+                                      ] for stimulated_electrode in response_df.stim_2])
+            stim_coords = (stim_1_coords + stim_2_coords) / 2
 
-        # --- Step 4: apply distance filtering per metric ---
-        response_mean = self.filter_by_distance(
-            patient_df[patient_df.metric == "mean"].copy(),
-            electrodes_df, self.min_distance_mm,
-        )
-        response_std = self.filter_by_distance(
-            patient_df[patient_df.metric == "std"].copy(),
-            electrodes_df, self.min_distance_mm,
-        )
+            recording_coords = np.array([
+                                            [electrodes_df[electrodes_df.index == stimulated_electrode].x,
+                                            electrodes_df[electrodes_df.index == stimulated_electrode].y,
+                                            electrodes_df[electrodes_df.index == stimulated_electrode].z
+                                         ] for stimulated_electrode in response_df.recording])
 
-        # --- Step 5: identify electrodes in both recording and stim roles ---
-        stim_channels = (
-            set(response_mean.stim_1.unique()) |
-            set(response_mean.stim_2.unique())
-        )
-        recording_stim_channels = set(response_mean.recording.unique()) & stim_channels
+            # Calculate Euclidean distance
+            distances = np.sqrt(np.sum((stim_coords - recording_coords) ** 2, axis=1))[:, 0]
 
-        if not recording_stim_channels:
-            logger.warning(f"{subject}: no channels appear in both recording and stim roles")
-            return []
+            # Keep only distances greater than 13mm
+            response_df = response_df[distances > 13]
+            distances = distances[distances > 13]
 
-        # --- Step 6: build one sample per electrode ---
-        samples: List[Dict[str, Any]] = []
+            # Add distances to DataFrame
+            response_df['distances'] = distances
+
+            # Sort by distances - used for CNN method
+            response_df = response_df.sort_values(by='distances', ascending=True)
+
+        except:
+            print("Error with subject", subject)
+
+        # Get channels used for both stimulation and recording
+        recording_stim_channels = set(response_df.recording.unique()).intersection(set(response_df.stim_2.unique()).union(set(response_df.stim_1.unique())))
+
+        channels_recording_trials, channels_stim_trials = [], []
+        
+        if labels:
+            channel_soz = []
+
+        if len(recording_stim_channels) == 0:
+            print(f"No stimulation events found for subject {subject}")
+            return None
+        
+        electrode_coords = []
+        electrode_lobes = []
 
         for channel in recording_stim_channels:
-            rec_mean  = response_mean[response_mean.recording == channel].select_dtypes(include="number")
-            rec_std   = response_std[response_std.recording   == channel].select_dtypes(include="number")
 
-            stim_mask_mean = response_mean.stim_1.eq(channel) | response_mean.stim_2.eq(channel)
-            stim_mask_std  = response_std.stim_1.eq(channel)  | response_std.stim_2.eq(channel)
-            stim_mean = response_mean[stim_mask_mean].select_dtypes(include="number")
-            stim_std  = response_std[stim_mask_std].select_dtypes(include="number")
+            # Current channel responses when other channels were stimulated
+            channel_recording_trials = response_df[response_df.recording == channel].select_dtypes(include='number').copy()
+            
+            # Other channel responses when current channel was stimulated
+            channel_stim_trials = response_df[np.logical_or(response_df.stim_1 == channel,
+                                                            response_df.stim_2 == channel)].select_dtypes(include='number').copy()
 
+            # Add to corresponding lists, except for recording/stim channel names (i.e., only time series)
+            channels_recording_trials.append(np.array(channel_recording_trials))
+            channels_stim_trials.append(np.array(channel_stim_trials))
+
+            if labels:
+                # Add label for current channel
+                channel_soz.append(electrodes_df[electrodes_df.index == channel].soz.iloc[0] == "yes")
+
+            electrode_coords.append([electrodes_df[electrodes_df.index == channel].x.iloc[0],
+                                     electrodes_df[electrodes_df.index == channel].y.iloc[0],
+                                     electrodes_df[electrodes_df.index == channel].z.iloc[0]])
+        
+            electrode_lobe = electrodes_df[electrodes_df.index == channel].Destrieux_label.values[0]
+            electrode_lobe = get_destrieux_lobe(electrode_lobe)
+            electrode_lobe = region_to_index[electrode_lobe]
+            electrode_lobes.append(electrode_lobe)
+        
+        # For recording channels
+        max_recording_rows = max(array.shape[0] for array in channels_recording_trials)
+        X_recording = pad_and_stack(channels_recording_trials, max_recording_rows).astype(np.float32)
+
+        # For stim channels
+        max_stim_rows = max(array.shape[0] for array in channels_stim_trials)
+        X_stim = pad_and_stack(channels_stim_trials, max_stim_rows).astype(np.float32)
+
+        if labels:
+            y = np.array(channel_soz, dtype=np.int32)
+            if y.sum() == 0:
+                return None
+            #np.save(f'../data/main/lobes_{subject}.npy', np.array(electrode_lobes))
+            #np.save(f'../data/main/y_{subject}.npy', y)
+            #np.save(f'../data/main/coords_{subject}.npy', np.array(electrode_coords))
+
+        # Save as np arrays
+        #np.save(f'../data/{metric}/X_stim_{subject}.npy', X_stim)
+        #np.save(f'../data/{metric}/X_recording_{subject}.npy', X_recording)
+
+        return electrode_lobes, y, electrode_coords, X_stim, X_recording
+
+
+class LocalizeSOZ(BaseTask):
+
+    task_name: str = "LocalizeSOZ"
+    input_schema: Dict[str, str] = {
+        "session_id": "string",
+        "task_id": "string",
+        "run_id": "string",
+        "header_file": "signal",
+        "electrodes_file": "signal",
+        "channels_file": "signal",
+        "events_file": "signal",
+    }
+    output_schema: Dict[str, str] = {"has_soz": "binary"}
+
+    def __call__(self, patient) -> List[Dict[str, Any]]:
+        samples: List[Dict[str, Any]] = []
+
+        for split in ("train", "eval"):
             try:
-                label = int(electrodes_df.loc[channel, "soz"].lower() == "yes")
-            except (KeyError, AttributeError):
-                logger.warning(f"{subject}/{channel}: missing SOZ label, skipping")
+                events = patient.get_events(split)
+            except (AttributeError, KeyError):
                 continue
 
-            try:
-                coords = torch.FloatTensor([
-                    electrodes_df.loc[channel, "x"],
-                    electrodes_df.loc[channel, "y"],
-                    electrodes_df.loc[channel, "z"],
-                ])
-            except KeyError:
-                coords = torch.full((3,), float("nan"))
+            for event in events:
+                pid = _event_value(event, "patient_id")
+                header_file = _event_value(event, "header_file")
+                events_file = _event_value(event, "events_file")
+                channels_file = _event_value(event, "channels_file")
+                electrodes_file = _event_value(event, "electrodes_file")
 
-            try:
-                lobe = self._get_lobe_index(
-                    int(electrodes_df.loc[channel, "Destrieux_label"])
+                if not all([pid, header_file, events_file, channels_file, electrodes_file]):
+                    continue
+
+                try:
+                    eeg = mne.io.read_raw_brainvision(
+                        header_file,
+                        verbose=False,
+                        preload=True,
+                    )
+                    events_df = pd.read_csv(events_file, sep="\t", index_col=0)
+                    channels_df = pd.read_csv(channels_file, sep="\t", index_col=0)
+                    electrodes_df = pd.read_csv(electrodes_file, sep="\t", index_col=0)
+
+                    stim_processor = StimulationDataProcessor(tmin=0.009, tmax=1)
+                    response_df = stim_processor.process_run_data(
+                        eeg,
+                        events_df,
+                        channels_df,
+                        pid,
+                    )
+                    if response_df is None:
+                        continue
+
+                    dataset_creator = DatasetCreator(response_df)
+                    processed = dataset_creator.process_for_analysis(pid, electrodes_df)
+                    if processed is None:
+                        continue
+
+                    electrode_lobes, y, electrode_coords, X_stim, X_recording = processed
+                except (ValueError, KeyError, IndexError, FileNotFoundError, OSError):
+                    continue
+
+                samples.append(
+                    {
+                        "patient_id": pid,
+                        "header_file": header_file,
+                        "events_file": events_file,
+                        "channels_file": channels_file,
+                        "electrodes_file": electrodes_file,
+                        "has_soz": int(np.sum(y) > 0),
+                        "y": y,
+                        "X_stim": X_stim,
+                        "X_recording": X_recording,
+                        "electrode_lobes": electrode_lobes,
+                        "electrode_coords": electrode_coords,
+                    }
                 )
-            except (KeyError, IndexError):
-                lobe = _REGION_TO_IDX["Unknown"]
 
-            samples.append(
-                {
-                    "patient_id":       subject,
-                    "electrode_name":   channel,
-                    "X_recording_mean": torch.FloatTensor(rec_mean.values),
-                    "X_stim_mean":      torch.FloatTensor(stim_mean.values),
-                    "X_recording_std":  torch.FloatTensor(rec_std.values),
-                    "X_stim_std":       torch.FloatTensor(stim_std.values),
-                    "coords":           coords,
-                    "lobe":             lobe,
-                    "label":            label,
-                }
-            )
-
-        logger.info(f"{subject}: built {len(samples)} electrode samples")
         return samples

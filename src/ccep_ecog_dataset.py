@@ -1,5 +1,6 @@
 """
 PyHealth dataset for the CCEP ECoG dataset.
+
 Dataset link:
     https://openneuro.org/datasets/ds004080
 """
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-import polars as pl
 import mne_bids
 
 from pyhealth.datasets import BaseDataset
@@ -21,54 +21,38 @@ logger = logging.getLogger(__name__)
 class CCEPECoGDataset(BaseDataset):
     """Dataset class for the CCEP ECoG dataset.
 
-    Dataset is organized in BIDS format. This class indexes subjects who have
-    all electrodes labeled, including at least one electrode in the Seizure
-    Onset Zone (SOZ).  All signal preprocessing is handled by the task
-    function (see ccep_ecog_task.py).
-
-    After initialization, ``self.global_event_df`` is a Polars LazyFrame
-    with one row per run and columns:
-
-    * ``patient_id``, ``session_id``, ``task_id``, ``run_id``
-    * ``header_file``    – path to the ``.vhdr`` signal file
-    * ``events_file``    – path to the ``*_events.tsv`` for that run
-    * ``channels_file``  – path to the ``*_channels.tsv`` for that run
-    * ``electrodes_file``– path to the ``*_electrodes.tsv`` for that run's session
-    * ``has_soz``        – bool, True if the subject has a complete SOZ column
-
-    This is the structure ``BaseDataset.get_patient`` filters to build each
-    ``Patient`` object passed to the task.
+    Dataset is organized in BIDS format. This class parses and labels subjects who have 
+    all electrodes labeled, including at least one electrode in the Seizure Onset Zone (SOZ).
+    
+    The raw BIDS directory should contain patient folders like `sub-<patient_id>`.
 
     Attributes:
-        root (str): Root directory of the raw BIDS data.
+        root (str): Root directory of the raw data.
         dataset_name (str): Name of the dataset.
+        config_path (str): Path to the configuration file.
     """
 
     def __init__(
         self,
         root: str = ".",
-        config_path: Optional[str] = None,
+        config_path: Optional[str] = str(Path(__file__).parent / "configs" / "ccep_ecog.yaml"),
         **kwargs,
     ) -> None:
         """Initializes the CCEP ECoG dataset.
 
         Args:
-            root (str): Root directory of the raw BIDS data.
-            config_path (Optional[str]): Path to a PyHealth config YAML.
+            root (str): Root directory of the raw data. Defaults to the working directory.
+            config_path (Optional[str]): Path to the configuration file. Defaults to "configs/ccep_ecog.yaml".
 
         Raises:
-            FileNotFoundError: If ``root`` does not exist.
-            ValueError: If the directory lacks the expected BIDS structure.
+            FileNotFoundError: If the dataset path does not exist.
+            ValueError: If the dataset does not adhere to the expected BIDS structure   .
 
         Example::
-
             >>> dataset = CCEPECoGDataset(root="./data/ds004080")
-            >>> patient = dataset.get_patient("ccepAgeUMCU01")
-            >>> patient.data_source["has_soz"][0]
-            True
         """
         self._verify_data(root)
-        meta = self._index_data(root)
+        self._index_data(root)
 
         super().__init__(
             root=root,
@@ -78,17 +62,11 @@ class CCEPECoGDataset(BaseDataset):
             **kwargs,
         )
 
-        # Populate the Polars LazyFrame and patient ID list that
-        # BaseDataset.get_patient relies on.
-        self.global_event_df = pl.from_pandas(meta).lazy()
-        self.unique_patient_ids = meta["patient_id"].unique().tolist()
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
-
     def _verify_data(self, root: str) -> None:
         """Verifies the presence and structure of the dataset directory.
+
+        Ensures the root path exists, verifies the presence of subject directories as well as 
+        at least one header file and electrode file.
 
         Args:
             root (str): Root directory of the raw data.
@@ -101,46 +79,46 @@ class CCEPECoGDataset(BaseDataset):
             msg = f"Dataset path '{root}' does not exist"
             logger.error(msg)
             raise FileNotFoundError(msg)
-
-        if not list(Path(root).glob("sub-*")):
+        
+        # Check for presence of subjects
+        subjects = list(Path(root).glob("sub-*"))
+        if not subjects:
             msg = f"BIDS root '{root}' contains no 'sub-*' subject folders"
             logger.error(msg)
             raise ValueError(msg)
 
+        # Check for at least one recording
         if not any(Path(root).rglob("*.vhdr")):
-            msg = f"BIDS root '{root}' contains no '.vhdr' signal files"
+            msg = f"BIDS root '{root}' contains no '.vhdr' files"
             logger.error(msg)
             raise ValueError(msg)
 
+        # Check for at least one electrode file
         if not any(Path(root).rglob("*_electrodes.tsv")):
-            msg = f"BIDS root '{root}' contains no '*_electrodes.tsv' files"
+            msg = f"BIDS root '{root}' contains no 'electrodes.tsv' file"
             logger.error(msg)
             raise ValueError(msg)
 
-    # ------------------------------------------------------------------
-    # Metadata indexing
-    # ------------------------------------------------------------------
+        # Check for at least one channels file
+        if not any(Path(root).rglob("*_channels.tsv")):
+            msg = f"BIDS root '{root}' contains no 'channels.tsv' files"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # Check for at least one events file
+        if not any(Path(root).rglob("*_events.tsv")):
+            msg = f"BIDS root '{root}' contains no 'events.tsv' files"
+            logger.error(msg)
+            raise ValueError(msg)
 
     def _index_data(self, root: str) -> pd.DataFrame:
-        """Parses BIDS directory and indexes all run-level file paths.
-
-        One row per (subject, run).  Columns:
-
-        * ``patient_id``, ``session_id``, ``task_id``, ``run_id``
-        * ``header_file``   – path to ``.vhdr``
-        * ``events_file``   – path to ``*_events.tsv`` for that run
-        * ``channels_file`` – path to ``*_channels.tsv`` for that run
-        * ``electrodes_file``– path to ``*_electrodes.tsv`` for that run's session
-        * ``has_soz``       – whether the subject has a complete SOZ column
-
-        Writes the table to ``<root>/ccep_ecog-metadata-pyhealth.csv`` and
-        returns it.
+        """Parses and indexes metadata for all available patients in the dataset.
 
         Args:
             root (str): Root directory of the raw data.
 
         Returns:
-            pd.DataFrame: The metadata table described above.
+            pd.DataFrame: Table of patient ECoG signal metadata.
         """
         try:
             subjects = mne_bids.get_entity_vals(root, "subject")
@@ -151,97 +129,69 @@ class CCEPECoGDataset(BaseDataset):
         root_path = Path(root)
 
         for sub in subjects:
+            has_soz = False
             patient_dir = root_path / f"sub-{sub}"
 
-            # Pre-pass: check whether any session for this subject has a fully
-            # labeled SOZ column.  We scan all electrode files up front so the
-            # has_soz flag is correct before we start appending run rows.
-            has_soz = False
             for tsv_file in patient_dir.rglob("*electrodes.tsv"):
                 try:
                     df = pd.read_csv(tsv_file, sep="\t")
                     cols = [c.lower() for c in df.columns]
                     if "soz" in cols:
                         col_series = df["soz"].str.lower()
+                        # Verify that there is at least one electrode in the SOZ and all electrodes are labeled
                         if (col_series == "yes").any() and col_series.isin(["yes", "no"]).all():
                             has_soz = True
                             break
                 except Exception as e:
-                    logger.warning(f"Skipping electrode file {tsv_file}: {e}")
+                    logger.warning(
+                        f"Skipping metadata file {tsv_file} due to error: {e}"
+                    )
+                    continue
 
-            # --- one row per run ---
             for header_file in patient_dir.rglob("*.vhdr"):
+                # Single electrodes.tsv file per session
+                elec_match = list(header_file.parent.glob("*electrodes.tsv"))
+                electrodes_file = str(elec_match[0]) if elec_match else ""
+
+                # Multiple channels.tsv and events.tsv files per session
+                # header_file has the same base name as channels.tsv and events.tsv
+                base_name = header_file.name.replace("_ieeg.vhdr", "")
+            
+                chan_path = header_file.parent / f"{base_name}_channels.tsv"
+                channels_file = str(chan_path) if chan_path.exists() else ""
+
+                evt_path = header_file.parent / f"{base_name}_events.tsv"
+                events_file = str(evt_path) if evt_path.exists() else ""
+
                 entities = mne_bids.get_entities_from_fname(str(header_file))
-
-                # All sibling TSV files are resolved from the same BIDSPath so
-                # each run gets files from its own session, not the first session
-                # found for the subject.
-                run_bids_path = mne_bids.BIDSPath(
-                    root=root,
-                    subject=sub,
-                    session=entities.get("session"),
-                    task=entities.get("task"),
-                    run=entities.get("run"),
-                    datatype="ieeg",
-                )
-
-                # Session-specific electrode file (no task / run in the path)
-                try:
-                    electrodes_file = str(
-                        run_bids_path.copy()
-                        .update(task=None, run=None, extension=".tsv", suffix="electrodes")
-                        .match()[0].fpath
-                    )
-                except Exception:
-                    electrodes_file = ""
-
-                try:
-                    events_file = str(
-                        run_bids_path.copy()
-                        .update(extension=".tsv", suffix="events")
-                        .match()[0].fpath
-                    )
-                except Exception:
-                    events_file = ""
-
-                try:
-                    channels_file = str(
-                        run_bids_path.copy()
-                        .update(extension=".tsv", suffix="channels")
-                        .match()[0].fpath
-                    )
-                except Exception:
-                    channels_file = ""
 
                 rows.append(
                     {
-                        "patient_id":     sub,
-                        "session_id":     entities.get("session", ""),
-                        "task_id":        entities.get("task", ""),
-                        "run_id":         entities.get("run", ""),
-                        "header_file":    str(header_file),
-                        "events_file":    events_file,
-                        "channels_file":  channels_file,
+                        "patient_id": sub,
+                        "session_id": entities.get("session", ""),
+                        "task_id": entities.get("task", ""),
+                        "run_id": entities.get("run", ""),
+                        "header_file": str(header_file),
                         "electrodes_file": electrodes_file,
-                        "has_soz":        has_soz,
+                        "channels_file": channels_file,
+                        "events_file": events_file,
+                        "has_soz": has_soz,
                     }
                 )
 
         if not rows:
             logger.warning(
-                "No valid BIDS ECoG header files (.vhdr) found. "
-                "Ensure the root directory follows the BIDS structure "
-                "(sub-*/ses-*/ieeg/*.vhdr)."
+                "No valid BIDS ECoG header files (.vhdr) were found for any subjects. "
+                "Ensure your root directory matches the BIDS structure (sub-*/ses-*/ieeg/*.vhdr)."
             )
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            df.sort_values("patient_id", inplace=True)
+            df.sort_values(["patient_id"], inplace=True)
             df.reset_index(drop=True, inplace=True)
 
         output_path = os.path.join(root, "ccep_ecog-metadata-pyhealth.csv")
         df.to_csv(output_path, index=False)
-        logger.info(f"Wrote metadata index to {output_path}")
+        logger.info(f"Wrote metadata to {output_path}")
 
         return df
-
