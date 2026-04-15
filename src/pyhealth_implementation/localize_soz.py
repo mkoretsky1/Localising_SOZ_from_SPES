@@ -106,15 +106,6 @@ def get_destrieux_lobe(label):
         return "Unknown"
 
 
-def _event_value(event, key, default=None):
-    """
-    Read a value from either a PyHealth event object or a metadata dict.
-    """
-    if isinstance(event, dict):
-        return event.get(key, default)
-    return getattr(event, key, default)
-
-
 class StimulationDataProcessor:
     def __init__(self, tmin, tmax):
         """
@@ -137,14 +128,14 @@ class StimulationDataProcessor:
         eeg.pick(chans_to_use)
 
         # Filter EEG data
-        eeg.filter(1, 150, n_jobs=-1, method='fir', fir_design='firwin')  # TODO
+        eeg.filter(1, 150, n_jobs=1, method='fir', fir_design='firwin')
 
         # Filter for electrical stimulation events
         stim_events = events_df[events_df.trial_type == "electrical_stimulation"].copy()
         
         # Filter for events that occur within the EEG data
         before = stim_events.shape[0]
-        stim_events = stim_events[stim_events['sample_start'] < eeg.tmax * eeg.info['sfreq']]
+        stim_events = stim_events[stim_events['sample_start'] < eeg.n_times]
         after = stim_events.shape[0]
 
         if before != after:
@@ -225,7 +216,8 @@ class StimulationDataProcessor:
                                                category_mapping, 
                                                subject, 
                                                remove_chans)
-            response_dfs.append(response_df)
+            if response_df is not None:
+                response_dfs.append(response_df)
 
         try:
             response_dfs = pd.concat(response_dfs)
@@ -250,10 +242,17 @@ class StimulationDataProcessor:
         # Remove channels that are artefacted
         recording_channels = [chan for chan in recording_channels if chan not in remove_chans]
 
-        epochs = mne.Epochs(eeg, result_array, event_id=event_id, tmin=self.tmin - 1
-                            , tmax=self.tmax, picks=recording_channels, preload=True, baseline=(None, -0.1))
-        epochs.crop(tmin=self.tmin)
-        epochs.resample(512)
+        try:
+            epochs = mne.Epochs(eeg, result_array, event_id=event_id, tmin=self.tmin - 1
+                                , tmax=self.tmax, picks=recording_channels, preload=True, baseline=(None, -0.1))
+            if len(epochs) < 5:
+                return None
+            epochs.crop(tmin=self.tmin)
+            epochs.resample(512)
+        except RuntimeError as e:
+            if "empty" in str(e).lower() or "epochs were dropped" in str(e).lower():
+                return None
+            raise
 
         # If less than 5 trials, return None
         if (epochs._data.shape[0]) < 5:
@@ -311,7 +310,67 @@ class DatasetCreator:
         Returns:
             None
         """
-        return self.process_metric_for_analysis(subject, electrodes_df, 'mean', labels=True)
+        mean_output = self.process_metric_for_analysis(
+            subject, electrodes_df, "mean", labels=True
+        )
+        std_output = self.process_metric_for_analysis(
+            subject, electrodes_df, "std", labels=True
+        )
+        if mean_output is None or std_output is None:
+            return None
+
+        (
+            mean_channels,
+            mean_lobes,
+            mean_y,
+            mean_coords,
+            mean_X_stim,
+            mean_X_recording,
+        ) = mean_output
+        (
+            std_channels,
+            _std_lobes,
+            _std_y,
+            _std_coords,
+            std_X_stim,
+            std_X_recording,
+        ) = std_output
+
+        std_channel_to_index = {
+            channel: index for index, channel in enumerate(std_channels)
+        }
+        common_channels = [
+            channel for channel in mean_channels if channel in std_channel_to_index
+        ]
+        if len(common_channels) == 0:
+            print(f"No paired mean/std stimulation events found for subject {subject}")
+            return None
+
+        X_stim = []
+        X_recording = []
+        electrode_lobes = []
+        electrode_coords = []
+        y = []
+        for mean_index, channel in enumerate(mean_channels):
+            if channel not in std_channel_to_index:
+                continue
+            std_index = std_channel_to_index[channel]
+            X_stim.append(np.stack([mean_X_stim[mean_index], std_X_stim[std_index]]))
+            X_recording.append(
+                np.stack([mean_X_recording[mean_index], std_X_recording[std_index]])
+            )
+            electrode_lobes.append(mean_lobes[mean_index])
+            electrode_coords.append(mean_coords[mean_index])
+            y.append(mean_y[mean_index])
+
+        return (
+            common_channels,
+            electrode_lobes,
+            np.array(y, dtype=np.int32),
+            electrode_coords,
+            np.stack(X_stim).astype(np.float32),
+            np.stack(X_recording).astype(np.float32),
+        )
 
     def process_metric_for_analysis(self, subject, electrodes_df, metric, labels=False):
         """
@@ -367,7 +426,11 @@ class DatasetCreator:
             print("Error with subject", subject)
 
         # Get channels used for both stimulation and recording
-        recording_stim_channels = set(response_df.recording.unique()).intersection(set(response_df.stim_2.unique()).union(set(response_df.stim_1.unique())))
+        recording_stim_channels = sorted(
+            set(response_df.recording.unique()).intersection(
+                set(response_df.stim_2.unique()).union(set(response_df.stim_1.unique()))
+            )
+        )
 
         channels_recording_trials, channels_stim_trials = [], []
         
@@ -427,40 +490,49 @@ class DatasetCreator:
         #np.save(f'../data/{metric}/X_stim_{subject}.npy', X_stim)
         #np.save(f'../data/{metric}/X_recording_{subject}.npy', X_recording)
 
-        return electrode_lobes, y, electrode_coords, X_stim, X_recording
+        return recording_stim_channels, electrode_lobes, y, electrode_coords, X_stim, X_recording
 
 
 class LocalizeSOZ(BaseTask):
+    """Electrode-level SOZ localization from CCEP ECoG responses.
+
+    Each returned sample corresponds to one candidate electrode. Multiple
+    samples may share the same patient/run identifiers; downstream splits
+    should group by ``patient_id`` to avoid leakage across electrodes from the
+    same patient.
+    """
 
     task_name: str = "LocalizeSOZ"
     input_schema: Dict[str, str] = {
-        "session_id": "string",
-        "task_id": "string",
-        "run_id": "string",
-        "header_file": "signal",
-        "electrodes_file": "signal",
-        "channels_file": "signal",
-        "events_file": "signal",
+        "X_stim": "tensor",
+        "X_recording": "tensor",
+        "electrode_lobes": "tensor",
+        "electrode_coords": "tensor",
     }
-    output_schema: Dict[str, str] = {"has_soz": "binary"}
+    output_schema: Dict[str, str] = {"soz": "binary"}
 
     def __call__(self, patient) -> List[Dict[str, Any]]:
         samples: List[Dict[str, Any]] = []
 
-        for split in ("train", "eval"):
+        for split in ("ecog", "train", "eval"):
             try:
                 events = patient.get_events(split)
             except (AttributeError, KeyError):
                 continue
 
             for event in events:
-                pid = _event_value(event, "patient_id")
-                header_file = _event_value(event, "header_file")
-                events_file = _event_value(event, "events_file")
-                channels_file = _event_value(event, "channels_file")
-                electrodes_file = _event_value(event, "electrodes_file")
+                pid = patient.patient_id
+                try:
+                    header_file = event.header_file
+                    events_file = event.events_file
+                    channels_file = event.channels_file
+                    electrodes_file = event.electrodes_file
+                except AttributeError:
+                    continue
 
-                if not all([pid, header_file, events_file, channels_file, electrodes_file]):
+                if not all(
+                    [pid, header_file, events_file, channels_file, electrodes_file]
+                ):
                     continue
 
                 try:
@@ -488,24 +560,43 @@ class LocalizeSOZ(BaseTask):
                     if processed is None:
                         continue
 
-                    electrode_lobes, y, electrode_coords, X_stim, X_recording = processed
+                    (
+                        electrode_channels,
+                        electrode_lobes,
+                        y,
+                        electrode_coords,
+                        X_stim,
+                        X_recording,
+                    ) = processed
                 except (ValueError, KeyError, IndexError, FileNotFoundError, OSError):
                     continue
 
-                samples.append(
-                    {
-                        "patient_id": pid,
-                        "header_file": header_file,
-                        "events_file": events_file,
-                        "channels_file": channels_file,
-                        "electrodes_file": electrodes_file,
-                        "has_soz": int(np.sum(y) > 0),
-                        "y": y,
-                        "X_stim": X_stim,
-                        "X_recording": X_recording,
-                        "electrode_lobes": electrode_lobes,
-                        "electrode_coords": electrode_coords,
-                    }
-                )
+                for electrode_idx, channel in enumerate(electrode_channels):
+                    electrode_id = f"{pid}-{event.session_id}-{event.run_id}-{channel}"
+                    samples.append(
+                        {
+                            "patient_id": pid,
+                            "visit_id": electrode_id,
+                            "record_id": electrode_id,
+                            "session_id": event.session_id,
+                            "task_id": event.task_id,
+                            "run_id": event.run_id,
+                            "channel": channel,
+                            "electrode_index": electrode_idx,
+                            "header_file": header_file,
+                            "events_file": events_file,
+                            "channels_file": channels_file,
+                            "electrodes_file": electrodes_file,
+                            "soz": int(y[electrode_idx]),
+                            "X_stim": X_stim[electrode_idx],
+                            "X_recording": X_recording[electrode_idx],
+                            "electrode_lobes": np.array(
+                                [electrode_lobes[electrode_idx]], dtype=np.int64
+                            ),
+                            "electrode_coords": np.array(
+                                electrode_coords[electrode_idx], dtype=np.float32
+                            ),
+                        }
+                    )
 
         return samples
